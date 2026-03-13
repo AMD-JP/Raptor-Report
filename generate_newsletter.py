@@ -1,16 +1,5 @@
-#!/usr/bin/env python3
 """
 Ford Raptor Price Trend Report Generator
-
-Changes requested:
- - Use GitHub source derived from:
-   https://github.com/AMD-JP/Raptor-Report/blob/main/generate_newsletter.py
-   (script normalizes that to the repo remote URL)
- - Output destination in file explorer:
-   C:\Users\jpichett\Raptor Report\newsletters
-
-Keeps original structure, .env loading, AMD OnPrem client pattern,
-and adds charts + KPI row for easier digestion.
 """
 
 import os
@@ -22,16 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-# plotting & data
 import numpy as np
 import matplotlib.pyplot as plt
 
-# LLM / git / env
 import openai
 import git
 from dotenv import load_dotenv
 
-# PDF generation
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
@@ -42,14 +28,15 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 
+
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
+
 _env = _SCRIPT_DIR / ".env"
 
-# preserve original env-loading semantics
 if _env.exists():
     with open(_env) as f:
         for line in f:
@@ -59,44 +46,15 @@ if _env.exists():
 else:
     load_dotenv(dotenv_path=_env)
 
-# ---------------------------------------------------------------------
-# User-specified changes
-# ---------------------------------------------------------------------
+API_KEY = os.environ.get("PROJECT_API_KEY", "")
 
-# The user provided a GitHub file URL; convert to a repo remote URL
-# Input from user:
-_USER_PROVIDED_GITHUB_FILE_URL = "https://github.com/AMD-JP/Raptor-Report/blob/main/generate_newsletter.py"
+# Git repo location
+REPO_PATH = Path(r"C:\Users\jpichett\Raptor-Report")
 
-def normalize_github_remote(file_url: str) -> str:
-    """
-    Convert a GitHub 'blob' file URL into the corresponding .git repo URL.
-    e.g.
-    https://github.com/AMD-JP/Raptor-Report/blob/main/generate_newsletter.py
-    -> https://github.com/AMD-JP/Raptor-Report.git
-    """
-    try:
-        # remove protocol & split
-        # find 'github.com/<owner>/<repo>'
-        m = re.match(r"https?://github\.com/([^/]+)/([^/]+)(/.*)?", file_url)
-        if not m:
-            return file_url  # fallback: return what we got
-        owner, repo = m.group(1), m.group(2)
-        return f"https://github.com/{owner}/{repo}.git"
-    except Exception:
-        return file_url
-
-GIT_REMOTE_URL = normalize_github_remote(_USER_PROVIDED_GITHUB_FILE_URL)
-
-# Destination folder requested:
-# Use raw string for Windows path
+# Output destination requested
 OUTPUT_DIR = Path(r"C:\Users\jpichett\Raptor Report\newsletters")
 
-# Default repo path: assume user cloned the repo into a local folder named "Raptor-Report" next to script,
-# but allow override with REPO_PATH env var
-REPO_PATH = os.environ.get("REPO_PATH", str(_SCRIPT_DIR / "Raptor-Report"))
-
-API_KEY = os.environ.get("PROJECT_API_KEY", "")
-GIT_REMOTE_NAME = "origin"
+GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
 
 MODEL = "GPT-oss-20B"
@@ -106,6 +64,7 @@ TEMPERATURE = 0.4
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------
 # COLORS
 # ---------------------------------------------------------------------
@@ -114,8 +73,9 @@ FORD_BLUE = colors.HexColor("#003478")
 GREY = colors.HexColor("#666666")
 BORDER = colors.HexColor("#DDDDDD")
 
+
 # ---------------------------------------------------------------------
-# AMD LLM CLIENT (UNCHANGED)
+# AMD LLM CLIENT
 # ---------------------------------------------------------------------
 
 def make_client():
@@ -128,22 +88,19 @@ def make_client():
         },
     )
 
+
 # ---------------------------------------------------------------------
 # TEXT SANITIZATION
 # ---------------------------------------------------------------------
 
-def clean_text(text: str) -> str:
-    """Sanitize LLM output so ReportLab never crashes."""
+def clean_text(text: str):
+
     if not text:
         return ""
 
-    # remove html tags
     text = re.sub(r"<[^>]+>", "", text)
-
-    # remove markdown
     text = re.sub(r"[#*`]", "", text)
 
-    # normalize unicode punctuation
     text = text.replace("\u2014", "-")
     text = text.replace("\u2013", "-")
     text = text.replace("\u2018", "'")
@@ -151,19 +108,19 @@ def clean_text(text: str) -> str:
     text = text.replace("\u201c", '"')
     text = text.replace("\u201d", '"')
 
-    # force ascii
     text = text.encode("ascii", "replace").decode("ascii")
 
-    # escape HTML characters so ReportLab doesn't interpret them
     text = escape(text)
 
     return text.strip()
+
 
 # ---------------------------------------------------------------------
 # LLM CALL
 # ---------------------------------------------------------------------
 
-def call_llm(client, prompt, section, max_tokens=None):
+def call_llm(client, prompt, section):
+
     log.info("Generating %s", section)
 
     system = (
@@ -173,7 +130,7 @@ def call_llm(client, prompt, section, max_tokens=None):
 
     response = client.chat.completions.create(
         model=MODEL,
-        max_completion_tokens=(max_tokens or MAX_TOKENS),
+        max_completion_tokens=MAX_TOKENS,
         temperature=TEMPERATURE,
         messages=[
             {"role": "system", "content": system},
@@ -182,120 +139,137 @@ def call_llm(client, prompt, section, max_tokens=None):
     )
 
     content = response.choices[0].message.content
+
     return clean_text(content)
+
 
 # ---------------------------------------------------------------------
 # REPORT CONTENT
 # ---------------------------------------------------------------------
 
 def generate_content(client, date):
+
     sections = {}
 
     sections["summary"] = call_llm(client, f"""
 Write a short executive summary for a Ford Raptor price report dated {date}.
 Explain whether prices are trending up or down.
-""", "Summary", max_tokens=140)
+""", "Summary")
 
     sections["history"] = call_llm(client, f"""
 Explain Ford Raptor MSRP changes from 2017 through 2025 and resale value trends.
-Keep this to three short bullets or two short paragraphs.
-""", "Historical Prices", max_tokens=220)
+""", "Historical Prices")
 
     sections["used"] = call_llm(client, f"""
 Analyze used Ford Raptor prices across the United States including depreciation
-and dealer markup behavior. Keep to three concise bullets.
-""", "Used Market", max_tokens=220)
+and dealer markup behavior.
+""", "Used Market")
 
     sections["regional"] = call_llm(client, f"""
 Explain regional Raptor price differences focusing on Texas, California,
-and Midwest markets. Keep to 2-3 short bullets.
-""", "Regional Markets", max_tokens=160)
+and Midwest markets.
+""", "Regional Markets")
 
     sections["competition"] = call_llm(client, f"""
 Explain how competitor trucks affect Raptor pricing including Ram TRX,
-Chevy Silverado ZR2 and Toyota TRD Pro. Keep to three concise bullets.
-""", "Competition", max_tokens=200)
+Chevy Silverado ZR2 and Toyota TRD Pro.
+""", "Competition")
 
     sections["outlook"] = call_llm(client, f"""
-Provide a short 12 month outlook for Ford Raptor pricing in 3 bullets.
-""", "Outlook", max_tokens=160)
+Provide a short 12 month outlook for Ford Raptor pricing.
+""", "Outlook")
 
     return sections
 
+
 # ---------------------------------------------------------------------
-# SYNTHETIC DATA FOR CHARTS (self-contained)
+# SAMPLE DATA FOR CHARTS
 # ---------------------------------------------------------------------
 
-def synth_data():
-    """Deterministic synthetic dataset for charts (2017-2025)."""
+def sample_data():
+
     years = list(range(2017, 2026))
-    base = np.array([55000 + (y - 2017) * 1500 for y in years], dtype=float)
-    rng = np.random.default_rng(2026)
-    noise = rng.normal(0, 800, size=base.shape)
-    msrp = (base + noise).round(-2)
+    base = np.array([55000 + (y - 2017) * 1500 for y in years])
+    noise = np.random.normal(0, 800, size=len(base))
+
+    msrp = base + noise
+
     regions = {
-        "Texas": (msrp * 1.02).round(-2),
-        "California": (msrp * 1.08).round(-2),
-        "Midwest": (msrp * 0.97).round(-2)
+        "Texas": msrp * 1.02,
+        "California": msrp * 1.08,
+        "Midwest": msrp * 0.97
     }
-    competition = {"Ram TRX": 28, "Chevy ZR2": 22, "Toyota TRD Pro": 18, "Other": 32}
-    latest_median = float(np.median(msrp[-3:]).round(2))
-    yoy = float(((msrp[-1] - msrp[-2]) / msrp[-2] * 100).round(2))
-    return {"years": years, "msrp": msrp.tolist(), "regions": regions, "competition": competition, "kpis": {"median_price": latest_median, "yoy_change_pct": yoy}}
+
+    competition = {
+        "Ram TRX": 28,
+        "Chevy ZR2": 22,
+        "Toyota TRD Pro": 18,
+        "Other": 32
+    }
+
+    return {
+        "years": years,
+        "msrp": msrp,
+        "regions": regions,
+        "competition": competition
+    }
+
 
 # ---------------------------------------------------------------------
-# CHARTS
+# CHART GENERATION
 # ---------------------------------------------------------------------
 
-def make_charts(data, outdir: Path):
-    outdir.mkdir(parents=True, exist_ok=True)
-    imgs = {}
+def make_charts(data, temp_dir):
 
-    # MSRP trend (line)
-    fig, ax = plt.subplots(figsize=(8, 3))
-    ax.plot(data["years"], data["msrp"], marker="o", linewidth=2)
-    ax.set_title("Ford Raptor MSRP — Median (2017–2025)", fontsize=10)
-    ax.set_xlabel("Year", fontsize=8)
-    ax.set_ylabel("MSRP (USD)", fontsize=8)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    p1 = outdir / "msrp_trend.png"
-    fig.tight_layout()
-    fig.savefig(p1, dpi=150)
-    plt.close(fig)
-    imgs["msrp_trend"] = str(p1)
+    charts = {}
 
-    # Regional bar (latest)
-    latest = {k: float(v[-1]) for k, v in data["regions"].items()}
-    fig, ax = plt.subplots(figsize=(6, 3))
+    # MSRP trend
+    fig, ax = plt.subplots()
+    ax.plot(data["years"], data["msrp"])
+    ax.set_title("Raptor MSRP Trend")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("MSRP")
+
+    path = temp_dir / "msrp.png"
+    fig.savefig(path)
+    plt.close()
+    charts["msrp"] = path
+
+    # Regional prices
+    latest = {k: v[-1] for k, v in data["regions"].items()}
+
+    fig, ax = plt.subplots()
     ax.bar(list(latest.keys()), list(latest.values()))
-    ax.set_title("Regional Average Asking Price (latest year)", fontsize=10)
-    ax.set_ylabel("Price (USD)", fontsize=8)
-    fig.tight_layout()
-    p2 = outdir / "regional_bar.png"
-    fig.savefig(p2, dpi=150)
-    plt.close(fig)
-    imgs["regional_bar"] = str(p2)
+    ax.set_title("Regional Price Comparison")
 
-    # Competition pie
+    path = temp_dir / "regions.png"
+    fig.savefig(path)
+    plt.close()
+    charts["regions"] = path
+
+    # Competition
     labels = list(data["competition"].keys())
     vals = list(data["competition"].values())
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.pie(vals, labels=labels, autopct="%1.0f%%", startangle=140)
-    ax.set_title("Relative Competitive Share", fontsize=10)
-    fig.tight_layout()
-    p3 = outdir / "competition_pie.png"
-    fig.savefig(p3, dpi=150)
-    plt.close(fig)
-    imgs["competition_pie"] = str(p3)
 
-    return imgs
+    fig, ax = plt.subplots()
+    ax.pie(vals, labels=labels)
+
+    path = temp_dir / "competition.png"
+    fig.savefig(path)
+    plt.close()
+    charts["competition"] = path
+
+    return charts
+
 
 # ---------------------------------------------------------------------
 # PDF STYLES
 # ---------------------------------------------------------------------
 
 def styles():
+
     return {
+
         "title": ParagraphStyle(
             "title",
             fontSize=24,
@@ -303,26 +277,23 @@ def styles():
             textColor=colors.white,
             alignment=TA_CENTER
         ),
+
         "section": ParagraphStyle(
             "section",
             fontSize=14,
             fontName="Helvetica-Bold",
             textColor=FORD_BLUE,
-            spaceBefore=12,
+            spaceBefore=16,
             spaceAfter=6
         ),
+
         "body": ParagraphStyle(
             "body",
             fontSize=10,
             leading=16,
             alignment=TA_JUSTIFY
         ),
-        "kpi": ParagraphStyle(
-            "kpi",
-            fontSize=10,
-            leading=12,
-            alignment=TA_CENTER
-        ),
+
         "footer": ParagraphStyle(
             "footer",
             fontSize=8,
@@ -331,18 +302,13 @@ def styles():
         )
     }
 
-# ---------------------------------------------------------------------
-# PARAGRAPH SPLITTER
-# ---------------------------------------------------------------------
-
-def split_paragraphs(text):
-    return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
 
 # ---------------------------------------------------------------------
-# PDF BUILDER (embeds charts + KPI table)
+# PDF BUILDER
 # ---------------------------------------------------------------------
 
-def build_pdf(sections, data, imgs, output, date):
+def build_pdf(sections, charts, output, date):
+
     s = styles()
 
     doc = SimpleDocTemplate(
@@ -351,156 +317,102 @@ def build_pdf(sections, data, imgs, output, date):
         leftMargin=0.75 * inch,
         rightMargin=0.75 * inch,
         topMargin=0.5 * inch,
-        bottomMargin=0.75 * inch,
-        title=f"Ford Raptor Price Report - {date}",
-        author="Raptor Price Tracker Bot",
+        bottomMargin=0.75 * inch
     )
 
     story = []
+
     width = letter[0] - 1.5 * inch
 
-    # Masthead
     masthead = Table([
         [Paragraph("FORD RAPTOR", s["title"])],
         [Paragraph("PRICE TREND REPORT", s["title"])],
         [Paragraph(date, s["footer"])]
     ], colWidths=[width])
+
     masthead.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), FORD_BLUE),
         ("TOPPADDING",(0,0),(-1,-1),16),
         ("BOTTOMPADDING",(0,0),(-1,-1),16)
     ]))
+
     story.append(masthead)
     story.append(Spacer(1,12))
 
-    # KPI row
-    kpis = data.get("kpis", {})
-    kpi_table = Table([
-        [Paragraph("Median (recent)", s["kpi"]), Paragraph("YoY %", s["kpi"]), Paragraph("Latest Year", s["kpi"])],
-        [f"${kpis.get('median_price',0):,.0f}", f"{kpis.get('yoy_change_pct',0):+.2f}%", str(data["years"][-1])]
-    ], colWidths=[width/3.0]*3)
-    kpi_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#F5F7FA")),
-        ("ALIGN",(0,1),(-1,-1),"CENTER"),
-        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
-        ("INNERGRID",(0,0),(-1,-1),0.25,BORDER),
-        ("BOX",(0,0),(-1,-1),0.5,BORDER),
-    ]))
-    story.append(kpi_table)
-    story.append(Spacer(1,10))
+    # charts
+    story.append(Image(str(charts["msrp"]), width=width, height=200))
+    story.append(Image(str(charts["regions"]), width=width, height=200))
+    story.append(Image(str(charts["competition"]), width=width, height=200))
 
-    # Executive summary
-    story.append(Paragraph("EXECUTIVE SUMMARY", s["section"]))
-    story.append(HRFlowable(width=width, thickness=1, color=FORD_BLUE))
-    for p in split_paragraphs(sections.get("summary","")):
-        story.append(Paragraph(p, s["body"]))
-    story.append(Spacer(1,10))
+    story.append(Spacer(1,20))
 
-    # Key visuals
-    story.append(Paragraph("KEY VISUALS", s["section"]))
-    story.append(HRFlowable(width=width, thickness=0.8, color=FORD_BLUE))
-    story.append(Spacer(1,6))
-    story.append(Image(imgs["msrp_trend"], width=width*0.95, height=3*inch))
-    story.append(Spacer(1,8))
-    two_col = Table([[Image(imgs["regional_bar"], width=width*0.47, height=2.0*inch),
-                      Image(imgs["competition_pie"], width=width*0.47, height=2.0*inch)]],
-                    colWidths=[width*0.49, width*0.49])
-    two_col.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
-    story.append(two_col)
-    story.append(Spacer(1,12))
-
-    # Short analytic sections (limit to 3 short paragraphs each)
-    sections_order = [
+    for title,key in [
+        ("EXECUTIVE SUMMARY","summary"),
         ("HISTORICAL PRICE TRENDS","history"),
         ("USED MARKET ANALYSIS","used"),
         ("REGIONAL MARKET DIFFERENCES","regional"),
         ("COMPETITOR IMPACT","competition"),
         ("PRICE OUTLOOK","outlook")
-    ]
+    ]:
 
-    for title, key in sections_order:
         story.append(Paragraph(title, s["section"]))
-        story.append(HRFlowable(width=width, thickness=0.6, color=BORDER))
-        for p in split_paragraphs(sections.get(key,""))[:3]:
-            story.append(Paragraph(p, s["body"]))
-            story.append(Spacer(1,8))
-
-    story.append(HRFlowable(width=width, thickness=0.5, color=BORDER))
-    story.append(Paragraph(f"Ford Raptor Price Report | Generated {date}", s["footer"]))
+        story.append(HRFlowable(width=width, thickness=1, color=FORD_BLUE))
+        story.append(Paragraph(sections[key], s["body"]))
+        story.append(Spacer(1,12))
 
     doc.build(story)
 
+
 # ---------------------------------------------------------------------
-# GIT PUSH (sets remote URL to the normalized one first)
+# GIT PUSH
 # ---------------------------------------------------------------------
 
 def commit_and_push(file):
-    try:
-        repo = git.Repo(REPO_PATH)
-    except Exception as e:
-        log.warning("Could not open repo at %s: %s", REPO_PATH, e)
-        return
 
-    try:
-        # ensure remote exists and points to the URL we normalized
-        try:
-            remote = repo.remote(name=GIT_REMOTE_NAME)
-            # update the remote URL to the normalized user-provided URL
-            try:
-                remote.set_url(GIT_REMOTE_URL)
-                log.info("Set remote '%s' URL to %s", GIT_REMOTE_NAME, GIT_REMOTE_URL)
-            except Exception as e:
-                log.warning("Could not set remote URL: %s", e)
-        except ValueError:
-            # remote doesn't exist; create it
-            try:
-                repo.create_remote(GIT_REMOTE_NAME, GIT_REMOTE_URL)
-                log.info("Created remote '%s' -> %s", GIT_REMOTE_NAME, GIT_REMOTE_URL)
-            except Exception as e:
-                log.warning("Could not create remote: %s", e)
+    repo = git.Repo(REPO_PATH)
 
-        repo.git.add(str(file.resolve()))
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        repo.index.commit(f"raptor price report [{timestamp}]")
-        # push; if remote isn't configured correctly, this may raise — catch and warn
-        repo.remote(name=GIT_REMOTE_NAME).push()
-        log.info("Pushed report to remote %s", GIT_REMOTE_NAME)
-    except Exception as e:
-        log.warning("Git push failed: %s", e)
+    repo.git.add(str(file.resolve()))
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    repo.index.commit(f"raptor price report [{timestamp}]")
+
+    repo.remote(name=GIT_REMOTE).push()
+
 
 # ---------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------
 
 def main():
+
     if not API_KEY:
         print("Missing PROJECT_API_KEY in .env")
         sys.exit(1)
 
-    # Ensure the output directory exists (Windows path included)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     date = datetime.now(timezone.utc).strftime("%B %d, %Y")
     file_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     output = OUTPUT_DIR / f"raptor_price_report_{file_date}.pdf"
 
     client = make_client()
 
-    # concise LLM-generated sections (keep original prompts but prefer short responses)
     sections = generate_content(client, date)
 
-    # synth data for charts
-    data = synth_data()
-    tmp_dir = Path(tempfile.mkdtemp(prefix="raptor_"))
-    imgs = make_charts(data, tmp_dir)
+    data = sample_data()
 
-    # build PDF with charts & KPIs
-    build_pdf(sections, data, imgs, output, date)
+    tmp = Path(tempfile.mkdtemp())
 
-    # commit & push to repo (attempts to set remote from provided URL)
+    charts = make_charts(data, tmp)
+
+    build_pdf(sections, charts, output, date)
+
     commit_and_push(output)
 
     log.info("Report generated: %s", output)
+
 
 if __name__ == "__main__":
     main()
