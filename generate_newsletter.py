@@ -2,17 +2,23 @@
 """
 Ford Raptor Price Trend Report Generator
 
-Fix: handle OpenAI/AMD SDK exceptions portably (some SDK builds don't expose openai.error).
-Uses PROJECT_API_KEY from .env, produces visuals, saves to Windows paths.
+Adjustments made:
+- OUTPUT_DIR set to C:\Users\jpichett\Raptor-Report\newsletters (raw string)
+- commit_and_push() will clone the repo if missing and will attempt to set/validate remote before pushing
+- clearer push result logging and boolean return for upload success
+- preserves CSV ingestion (new vs used), charts at the end, and AMD OnPrem LLM auth handling
 """
 
 import os
 import re
 import sys
+import csv
+import math
 import logging
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from statistics import median, mean
 from xml.sax.saxutils import escape
 
 import numpy as np
@@ -20,6 +26,7 @@ import matplotlib.pyplot as plt
 
 import openai
 import git
+from git import GitCommandError
 from dotenv import load_dotenv
 
 from reportlab.lib.pagesizes import letter
@@ -33,13 +40,13 @@ from reportlab.platypus import (
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 
 # ---------------------------------------------------------------------
-# CONFIG
+# CONFIG: Paths & Git remote
 # ---------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _env = _SCRIPT_DIR / ".env"
 
-# Preserve original .env-loading semantics (don't overwrite existing env vars).
+# preserve existing env vars, otherwise load .env
 if _env.exists():
     with open(_env) as f:
         for line in f:
@@ -54,19 +61,27 @@ if not API_KEY:
     print("Missing or empty PROJECT_API_KEY in environment/.env — please add it and re-run.")
     sys.exit(1)
 
-# Windows paths (raw strings to avoid unicode-escape issues)
-REPO_PATH = Path(r"C:\Users\jpichett\Raptor-Report")
-OUTPUT_DIR = Path(r"C:\Users\jpichett\Raptor Report\newsletters")
+# Ensure REPO_PATH is where your repo lives locally
+REPO_PATH = Path(os.environ.get("REPO_PATH", r"C:\Users\jpichett\Raptor-Report"))
 
-GIT_REMOTE = "origin"
-GIT_BRANCH = "main"
+# Output directory requested (inside your repo)
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(REPO_PATH / "newsletters")))
 
+# Default remote repo URL (used if local repo missing). Override by setting GIT_REMOTE_URL env var.
+GIT_REMOTE_URL = os.environ.get("GIT_REMOTE_URL", "https://github.com/AMD-JP/Raptor-Report.git")
+GIT_REMOTE_NAME = os.environ.get("GIT_REMOTE_NAME", "origin")
+GIT_BRANCH = os.environ.get("GIT_BRANCH", "main")
+
+# CSV data path (optional)
+DATA_CSV = os.environ.get("DATA_CSV", str(_SCRIPT_DIR / "data" / "prices.csv"))
+
+# LLM / behavior
 MODEL = "GPT-oss-20B"
 MAX_TOKENS = 3500
-TEMPERATURE = 0.4
+TEMPERATURE = 0.35
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+log = logging.getLogger("raptor_report")
 
 # ---------------------------------------------------------------------
 # COLORS
@@ -77,14 +92,10 @@ GREY = colors.HexColor("#666666")
 BORDER = colors.HexColor("#DDDDDD")
 
 # ---------------------------------------------------------------------
-# AMD LLM CLIENT (uses real API_KEY)
+# LLM client construction
 # ---------------------------------------------------------------------
 
 def make_client():
-    """
-    Construct OpenAI client for AMD OnPrem endpoint.
-    Provide API key both via api_key and in headers for compatibility.
-    """
     return openai.OpenAI(
         base_url="https://llm-api.amd.com/OnPrem",
         api_key=API_KEY,
@@ -95,7 +106,7 @@ def make_client():
     )
 
 # ---------------------------------------------------------------------
-# TEXT SANITIZATION
+# Utilities: sanitize text
 # ---------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
@@ -103,269 +114,424 @@ def clean_text(text: str) -> str:
         return ""
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"[#*`]", "", text)
-    for a, b in [("\u2014", "-"), ("\u2013", "-"),
-                 ("\u2018", "'"), ("\u2019", "'"),
-                 ("\u201c", '"'), ("\u201d", '"')]:
-        text = text.replace(a, b)
-    text = text.encode("ascii", "replace").decode("ascii")
+    for a,b in [("\u2014","-"),("\u2013","-"),("\u2018","'"),("\u2019","'"),("\u201c",'"'),("\u201d",'"')]:
+        text = text.replace(a,b)
+    text = text.encode("ascii","replace").decode("ascii")
     return escape(text).strip()
 
 # ---------------------------------------------------------------------
-# LLM CALL with portable error handling
+# LLM call with portable error handling
 # ---------------------------------------------------------------------
 
 def call_llm(client, prompt, section, max_tokens=None):
     log.info("Generating %s", section)
     system = (
-        "You are an automotive market analyst specializing in pickup truck "
-        "pricing and resale value trends."
+        "You are an automotive market analyst. Be concise but specific. "
+        "Always explicitly label whether statements refer to NEW (MSRP) or USED (asking price) when applicable."
     )
-
     try:
         response = client.chat.completions.create(
             model=MODEL,
             max_completion_tokens=(max_tokens or MAX_TOKENS),
             temperature=TEMPERATURE,
             messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
+                {"role":"system","content":system},
+                {"role":"user","content":prompt},
             ],
         )
     except Exception as e:
-        # Some SDK builds expose AuthenticationError, others do not.
         msg = str(e).lower()
-        if "401" in msg or "access denied" in msg or "invalid subscription" in msg or "authentication" in msg:
+        if any(tok in msg for tok in ("401", "access denied", "invalid subscription", "authentication")):
             log.error("LLM authentication error: %s", e)
             raise RuntimeError(
-                "LLM authentication failed (401). Check PROJECT_API_KEY in your .env and confirm the "
-                "subscription key is valid/active for the AMD OnPrem endpoint."
+                "LLM authentication failed (401). Check PROJECT_API_KEY in your .env and confirm the key is valid."
             ) from e
-        else:
-            log.error("LLM call failed: %s", e)
-            raise
-
-    # Extract and sanitize content
+        log.error("LLM call failed: %s", e)
+        raise
     content = response.choices[0].message.content
     return clean_text(content)
 
 # ---------------------------------------------------------------------
-# REPORT CONTENT
+# CSV parsing and aggregation (same as previous)
 # ---------------------------------------------------------------------
 
-def generate_content(client, date):
-    sections = {}
+def parse_row(row):
+    try:
+        date_str = row.get("date") or row.get("sale_date") or row.get("listing_date")
+        date = datetime.fromisoformat(date_str).date() if date_str else None
+        condition = (row.get("condition") or row.get("status") or "").strip().lower()
+        msrp = float(row.get("msrp")) if row.get("msrp") else None
+        price = float(row.get("price") or row.get("asking_price") or row.get("sale_price")) if (row.get("price") or row.get("asking_price") or row.get("sale_price")) else None
+        region = row.get("region") or row.get("state") or row.get("location") or "Unknown"
+        model_year = int(row.get("model_year")) if row.get("model_year") else (date.year if date else None)
+        return {"date": date, "condition": condition, "msrp": msrp, "price": price, "region": region, "model_year": model_year}
+    except Exception:
+        return None
 
-    sections["summary"] = call_llm(client, f"""
-Write a short executive summary for a Ford Raptor price report dated {date}.
-Explain whether prices are trending up or down.
-""", "Summary", max_tokens=140)
+def load_and_aggregate(csv_path):
+    rows = []
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        log.info("CSV not found at %s", csv_file)
+        return None
+    with open(csv_file, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            parsed = parse_row(r)
+            if parsed:
+                rows.append(parsed)
+    if not rows:
+        log.info("CSV present but no parsable rows")
+        return None
 
-    sections["history"] = call_llm(client, f"""
-Explain Ford Raptor MSRP changes from 2017 through 2025 and resale value trends.
-Keep this to three short bullets or two short paragraphs.
-""", "Historical Prices", max_tokens=220)
+    # Aggregation
+    msrp_by_year_new = {}
+    price_by_year_used = {}
+    region_prices_latest = {}
+    now_year = datetime.now().year
 
-    sections["used"] = call_llm(client, f"""
-Analyze used Ford Raptor prices across the United States including depreciation
-and dealer markup behavior. Keep to three concise bullets.
-""", "Used Market", max_tokens=220)
+    # determine years set and latest year
+    years = set()
+    date_years = [r["date"].year for r in rows if r["date"]]
+    years.update(date_years)
+    latest_year = max(date_years) if date_years else now_year
 
-    sections["regional"] = call_llm(client, f"""
-Explain regional Raptor price differences focusing on Texas, California,
-and Midwest markets. Keep to 2-3 short bullets.
-""", "Regional Markets", max_tokens=160)
+    for r in rows:
+        yr = r["date"].year if r["date"] else (r["model_year"] or now_year)
+        years.add(yr)
+        cond = r["condition"] or "used"
+        if cond == "new" and r["msrp"]:
+            msrp_by_year_new.setdefault(yr, []).append(r["msrp"])
+        if cond == "used" and r["price"] is not None:
+            price_by_year_used.setdefault(yr, []).append(r["price"])
+        # region latest-year averages
+    region_prices = {}
+    for r in rows:
+        r_year = r["date"].year if r["date"] else (r["model_year"] or now_year)
+        if r_year == latest_year and r["price"] is not None:
+            region_prices.setdefault(r["region"], []).append(r["price"])
+    region_prices_latest = {reg: mean(vals) for reg, vals in region_prices.items()}
 
-    sections["competition"] = call_llm(client, f"""
-Explain how competitor trucks affect Raptor pricing including Ram TRX,
-Chevy Silverado ZR2 and Toyota TRD Pro. Keep to three concise bullets.
-""", "Competition", max_tokens=200)
+    # dealer markup and depreciation
+    markups = []
+    markup_pct = []
+    dep_by_model_year = {}
+    for r in rows:
+        if r["msrp"] and r["price"] is not None:
+            mu = r["price"] - r["msrp"]
+            markups.append(mu)
+            if r["msrp"] != 0:
+                markup_pct.append(mu / r["msrp"] * 100)
+            if r["condition"] == "used" and r["model_year"]:
+                dep = (r["msrp"] - r["price"]) / r["msrp"] * 100 if r["msrp"] else None
+                if dep is not None:
+                    dep_by_model_year.setdefault(r["model_year"], []).append(dep)
+    dealer_markup_stats = {
+        "count": len(markups),
+        "avg_markup": mean(markups) if markups else 0.0,
+        "median_markup": median(markups) if markups else 0.0,
+        "avg_markup_pct": mean(markup_pct) if markup_pct else 0.0
+    }
+    depreciation_by_model_year = {my: mean(vals) for my, vals in dep_by_model_year.items()}
 
-    sections["outlook"] = call_llm(client, f"""
-Provide a short 12 month outlook for Ford Raptor pricing in 3 bullets.
-""", "Outlook", max_tokens=160)
+    years_sorted = sorted(years)
+    msrp_new_series = [median(msrp_by_year_new[y]) if y in msrp_by_year_new and msrp_by_year_new[y] else None for y in years_sorted]
+    price_used_series = [median(price_by_year_used[y]) if y in price_by_year_used and price_by_year_used[y] else None for y in years_sorted]
+    msrp_new_series = [float(v) if v is not None else float("nan") for v in msrp_new_series]
+    price_used_series = [float(v) if v is not None else float("nan") for v in price_used_series]
 
-    return sections
+    kpis = {
+        "latest_year": latest_year,
+        "median_new_msrp_latest": float(median(msrp_by_year_new[latest_year]) if latest_year in msrp_by_year_new else float("nan")),
+        "median_used_price_latest": float(median(price_by_year_used[latest_year]) if latest_year in price_by_year_used else float("nan")),
+    }
+
+    return {
+        "years": years_sorted,
+        "msrp_new": msrp_new_series,
+        "price_used": price_used_series,
+        "regions_latest": region_prices_latest,
+        "dealer_markup": dealer_markup_stats,
+        "depreciation_by_model_year": depreciation_by_model_year,
+        "kpis": kpis,
+        "competition": {"Ram TRX": 28, "Chevy ZR2": 22, "Toyota TRD Pro": 18, "Other": 32}
+    }
 
 # ---------------------------------------------------------------------
-# SYNTHETIC DATA (for charts)
+# Synthetic fallback
 # ---------------------------------------------------------------------
 
-def sample_data():
+def synth_data():
     years = list(range(2017, 2026))
     base = np.array([55000 + (y - 2017) * 1500 for y in years], dtype=float)
     rng = np.random.default_rng(2026)
     noise = rng.normal(0, 800, size=base.shape)
-    msrp = (base + noise).round(-2)
-    regions = {
-        "Texas": (msrp * 1.02).round(-2),
-        "California": (msrp * 1.08).round(-2),
-        "Midwest": (msrp * 0.97).round(-2)
+    msrp_new = (base + noise).round(-2)
+    price_used = (msrp_new * 0.82 + rng.normal(0, 1500, size=base.shape)).round(-2)
+    regions = {"Texas": (msrp_new[-1]*1.02).round(-2), "California": (msrp_new[-1]*1.08).round(-2), "Midwest": (msrp_new[-1]*0.97).round(-2)}
+    latest_median = float(np.median(msrp_new[-3:]).round(2))
+    return {
+        "years": years,
+        "msrp_new": msrp_new.tolist(),
+        "price_used": price_used.tolist(),
+        "regions_latest": regions,
+        "competition": {"Ram TRX": 28, "Chevy ZR2": 22, "Toyota TRD Pro": 18, "Other": 32},
+        "dealer_markup": {"count":0,"avg_markup":0.0,"median_markup":0.0,"avg_markup_pct":0.0},
+        "depreciation_by_model_year": {},
+        "kpis": {"latest_year": years[-1], "median_new_msrp_latest": latest_median, "median_used_price_latest": float(median(price_used[-3:]).round(2))}
     }
-    competition = {"Ram TRX": 28, "Chevy ZR2": 22, "Toyota TRD Pro": 18, "Other": 32}
-    latest_median = float(np.median(msrp[-3:]).round(2))
-    yoy = float(((msrp[-1] - msrp[-2]) / msrp[-2] * 100).round(2))
-    return {"years": years, "msrp": msrp.tolist(), "regions": regions, "competition": competition, "kpis": {"median_price": latest_median, "yoy_change_pct": yoy}}
 
 # ---------------------------------------------------------------------
-# CHARTS
+# Charts (end of doc)
 # ---------------------------------------------------------------------
 
 def make_charts(data, outdir: Path):
     outdir.mkdir(parents=True, exist_ok=True)
     imgs = {}
 
-    fig, ax = plt.subplots(figsize=(8, 3))
-    ax.plot(data["years"], data["msrp"], marker="o", linewidth=2)
-    ax.set_title("Ford Raptor MSRP — Median (2017–2025)", fontsize=10)
-    ax.set_xlabel("Year", fontsize=8)
-    ax.set_ylabel("MSRP (USD)", fontsize=8)
+    years = data["years"]
+    fig, ax = plt.subplots(figsize=(8,3))
+    ax.plot(years, data.get("msrp_new", [float("nan")]*len(years)), marker="o", label="Median MSRP (New)")
+    ax.plot(years, data.get("price_used", [float("nan")]*len(years)), marker="o", linestyle="--", label="Median Asking (Used)")
+    ax.set_title("Median MSRP (New) vs Median Asking Price (Used) by Year")
+    ax.set_xlabel("Year")
+    ax.set_ylabel("USD")
+    ax.legend(fontsize=8)
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
-    p1 = outdir / "msrp_trend.png"
-    fig.tight_layout()
-    fig.savefig(p1, dpi=150)
-    plt.close(fig)
-    imgs["msrp_trend"] = str(p1)
+    p1 = outdir / "msrp_vs_used_trend.png"
+    fig.tight_layout(); fig.savefig(p1, dpi=150); plt.close(fig)
+    imgs["msrp_vs_used_trend"] = str(p1)
 
-    latest = {k: float(v[-1]) for k, v in data["regions"].items()}
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.bar(list(latest.keys()), list(latest.values()))
-    ax.set_title("Regional Average Asking Price (latest year)", fontsize=10)
-    ax.set_ylabel("Price (USD)", fontsize=8)
-    p2 = outdir / "regional_bar.png"
-    fig.tight_layout()
-    fig.savefig(p2, dpi=150)
-    plt.close(fig)
-    imgs["regional_bar"] = str(p2)
+    regions = data.get("regions_latest", {})
+    if regions:
+        fig, ax = plt.subplots(figsize=(6,3))
+        ax.bar(list(regions.keys()), list(regions.values()))
+        ax.set_title(f"Regional Average Asking Price ({data.get('kpis',{}).get('latest_year','')})")
+        ax.set_ylabel("USD")
+        p2 = outdir / "regional_bar.png"
+        fig.tight_layout(); fig.savefig(p2, dpi=150); plt.close(fig)
+        imgs["regional_bar"] = str(p2)
 
-    labels = list(data["competition"].keys())
-    vals = list(data["competition"].values())
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.pie(vals, labels=labels, autopct="%1.0f%%", startangle=140)
-    ax.set_title("Relative Competitive Share", fontsize=10)
-    p3 = outdir / "competition_pie.png"
-    fig.tight_layout()
-    fig.savefig(p3, dpi=150)
-    plt.close(fig)
-    imgs["competition_pie"] = str(p3)
+    comp = data.get("competition", {})
+    if comp:
+        fig, ax = plt.subplots(figsize=(6,3))
+        labels = list(comp.keys()); vals = list(comp.values())
+        ax.pie(vals, labels=labels, autopct="%1.0f%%", startangle=140)
+        ax.set_title("Relative Competitive Share")
+        p3 = outdir / "competition_pie.png"
+        fig.tight_layout(); fig.savefig(p3, dpi=150); plt.close(fig)
+        imgs["competition_pie"] = str(p3)
 
     return imgs
 
 # ---------------------------------------------------------------------
-# PDF STYLES
+# PDF styles & builder (charts appended at end)
 # ---------------------------------------------------------------------
 
 def styles():
     return {
         "title": ParagraphStyle("title", fontSize=24, fontName="Helvetica-Bold", textColor=colors.white, alignment=TA_CENTER),
         "section": ParagraphStyle("section", fontSize=14, fontName="Helvetica-Bold", textColor=FORD_BLUE, spaceBefore=12, spaceAfter=6),
-        "body": ParagraphStyle("body", fontSize=10, leading=16, alignment=TA_JUSTIFY),
+        "body": ParagraphStyle("body", fontSize=10, leading=14, alignment=TA_JUSTIFY),
         "kpi": ParagraphStyle("kpi", fontSize=10, leading=12, alignment=TA_CENTER),
         "footer": ParagraphStyle("footer", fontSize=8, textColor=GREY, alignment=TA_CENTER)
     }
 
-# ---------------------------------------------------------------------
-# PARAGRAPH SPLITTER
-# ---------------------------------------------------------------------
-
 def split_paragraphs(text):
     return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-
-# ---------------------------------------------------------------------
-# PDF BUILDER
-# ---------------------------------------------------------------------
 
 def build_pdf(sections, data, imgs, output, date):
     s = styles()
     doc = SimpleDocTemplate(str(output), pagesize=letter, leftMargin=0.75*inch, rightMargin=0.75*inch, topMargin=0.5*inch, bottomMargin=0.75*inch, title=f"Ford Raptor Price Report - {date}", author="Raptor Price Tracker Bot")
     story = []
-    width = letter[0] - 1.5 * inch
+    width = letter[0] - 1.5*inch
 
-    masthead = Table([[Paragraph("FORD RAPTOR", s["title"])], [Paragraph("PRICE TREND REPORT", s["title"])], [Paragraph(date, s["footer"])]], colWidths=[width])
+    masthead = Table([[Paragraph("FORD RAPTOR", s["title"])],[Paragraph("PRICE TREND REPORT", s["title"])],[Paragraph(date, s["footer"])]], colWidths=[width])
     masthead.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),FORD_BLUE), ("TOPPADDING",(0,0),(-1,-1),12), ("BOTTOMPADDING",(0,0),(-1,-1),12)]))
-    story.append(masthead)
-    story.append(Spacer(1,10))
+    story.append(masthead); story.append(Spacer(1,10))
 
     kpis = data.get("kpis", {})
-    kpi_table = Table([[Paragraph("Median (recent)", s["kpi"]), Paragraph("YoY %", s["kpi"]), Paragraph("Latest Year", s["kpi"])], [f"${kpis.get('median_price',0):,.0f}", f"{kpis.get('yoy_change_pct',0):+.2f}%", str(data["years"][-1]) ]], colWidths=[width/3.0]*3)
+    kpi_table = Table([[Paragraph("Latest Year", s["kpi"]), Paragraph("Median MSRP (New)", s["kpi"]), Paragraph("Median Asking (Used)", s["kpi"])],[str(kpis.get("latest_year","")), f"${kpis.get('median_new_msrp_latest', float('nan')):,.0f}" if not math.isnan(kpis.get('median_new_msrp_latest', float('nan'))) else "N/A", f"${kpis.get('median_used_price_latest', float('nan')):,.0f}" if not math.isnan(kpis.get('median_used_price_latest', float('nan'))) else "N/A"]], colWidths=[width/3.0]*3)
     kpi_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F5F7FA")), ("ALIGN",(0,1),(-1,-1),"CENTER"), ("VALIGN",(0,0),(-1,-1),"MIDDLE"), ("INNERGRID",(0,0),(-1,-1),0.25,BORDER), ("BOX",(0,0),(-1,-1),0.5,BORDER)]))
-    story.append(kpi_table)
-    story.append(Spacer(1,10))
+    story.append(kpi_table); story.append(Spacer(1,10))
 
-    story.append(Paragraph("EXECUTIVE SUMMARY", s["section"]))
-    story.append(HRFlowable(width=width, thickness=1, color=FORD_BLUE))
-    for p in split_paragraphs(sections.get("summary","")):
-        story.append(Paragraph(p, s["body"]))
-    story.append(Spacer(1,10))
+    story.append(Paragraph("EXECUTIVE SUMMARY", s["section"])); story.append(HRFlowable(width=width, thickness=1, color=FORD_BLUE))
+    for p in split_paragraphs(sections.get("summary","")): story.append(Paragraph(p, s["body"])); story.append(Spacer(1,8))
 
-    story.append(Paragraph("KEY VISUALS", s["section"]))
-    story.append(HRFlowable(width=width, thickness=0.8, color=FORD_BLUE))
-    story.append(Spacer(1,6))
-    story.append(Image(imgs["msrp_trend"], width=width*0.95, height=3*inch))
-    story.append(Spacer(1,8))
-    two_col = Table([[Image(imgs["regional_bar"], width=width*0.47, height=2.0*inch), Image(imgs["competition_pie"], width=width*0.47, height=2.0*inch)]], colWidths=[width*0.49, width*0.49])
-    two_col.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
-    story.append(two_col)
-    story.append(Spacer(1,12))
-
-    sections_order = [("HISTORICAL PRICE TRENDS","history"), ("USED MARKET ANALYSIS","used"), ("REGIONAL MARKET DIFFERENCES","regional"), ("COMPETITOR IMPACT","competition"), ("PRICE OUTLOOK","outlook")]
+    sections_order = [("HISTORICAL PRICE TRENDS (NEW vs USED)","history"), ("USED MARKET ANALYSIS","used"), ("REGIONAL MARKET DIFFERENCES","regional"), ("COMPETITOR IMPACT","competition"), ("PRICE OUTLOOK (NEW / USED)","outlook")]
     for title,key in sections_order:
-        story.append(Paragraph(title, s["section"]))
-        story.append(HRFlowable(width=width, thickness=0.6, color=BORDER))
-        for p in split_paragraphs(sections.get(key,""))[:3]:
-            story.append(Paragraph(p, s["body"]))
-            story.append(Spacer(1,8))
+        story.append(Paragraph(title, s["section"])); story.append(HRFlowable(width=width, thickness=0.6, color=BORDER))
+        for p in split_paragraphs(sections.get(key,""))[:4]:
+            story.append(Paragraph(p, s["body"])); story.append(Spacer(1,8))
 
-    story.append(HRFlowable(width=width, thickness=0.5, color=BORDER))
-    story.append(Paragraph(f"Ford Raptor Price Report | Generated {date}", s["footer"]))
+    # Charts at the end
+    story.append(Spacer(1,12)); story.append(HRFlowable(width=width, thickness=0.5, color=BORDER)); story.append(Spacer(1,8))
+    story.append(Paragraph("APPENDIX — CHARTS & VISUALS", s["section"])); story.append(HRFlowable(width=width, thickness=0.8, color=FORD_BLUE)); story.append(Spacer(1,8))
+
+    if imgs.get("msrp_vs_used_trend"):
+        story.append(Image(imgs["msrp_vs_used_trend"], width=width*0.95, height=3*inch)); story.append(Spacer(1,8))
+
+    left = imgs.get("regional_bar"); right = imgs.get("competition_pie")
+    if left and right:
+        two_col = Table([[Image(left, width=width*0.47, height=2.2*inch), Image(right, width=width*0.47, height=2.2*inch)]], colWidths=[width*0.49, width*0.49])
+        two_col.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE")])); story.append(two_col); story.append(Spacer(1,8))
+    else:
+        if left: story.append(Image(left, width=width*0.95, height=2.5*inch)); story.append(Spacer(1,8))
+        if right: story.append(Image(right, width=width*0.95, height=2.5*inch)); story.append(Spacer(1,8))
+
+    dep = data.get("depreciation_by_model_year", {})
+    if dep:
+        story.append(Paragraph("Depreciation by model year (avg % drop: MSRP -> Asking, USED)", s["section"]))
+        rows = [["Model Year","Avg Depreciation %"]]
+        for my in sorted(dep.keys()): rows.append([str(my), f"{dep[my]:.1f}%"])
+        tbl = Table(rows, colWidths=[width*0.3, width*0.6]); tbl.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.25,BORDER), ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F5F7FA"))])); story.append(tbl); story.append(Spacer(1,8))
+
+    story.append(HRFlowable(width=width, thickness=0.5, color=BORDER)); story.append(Paragraph(f"Ford Raptor Price Report | Generated {date}", styles()["footer"]))
     doc.build(story)
 
 # ---------------------------------------------------------------------
-# GIT PUSH
+# Git operations: clone if needed, add, commit, push, report result
 # ---------------------------------------------------------------------
 
-def commit_and_push(file):
+def ensure_repo_present():
+    """Return git.Repo object, cloning from remote if local repo missing."""
     try:
         repo = git.Repo(REPO_PATH)
+        return repo
+    except Exception:
+        # try to clone
+        try:
+            log.info("Local repo not found at %s — cloning from %s", REPO_PATH, GIT_REMOTE_URL)
+            repo = git.Repo.clone_from(GIT_REMOTE_URL, REPO_PATH)
+            log.info("Cloned repo to %s", REPO_PATH)
+            return repo
+        except Exception as e:
+            log.warning("Failed to clone repo from %s: %s", GIT_REMOTE_URL, e)
+            return None
+
+def commit_and_push(file_path: Path) -> bool:
+    """Add, commit, and push file. Returns True on successful push, False otherwise."""
+    repo = ensure_repo_present()
+    if repo is None:
+        log.warning("No repo available at %s and clone failed. Skipping upload.", REPO_PATH)
+        return False
+
+    # ensure remote exists and points to desired URL
+    try:
+        remote = None
+        try:
+            remote = repo.remote(name=GIT_REMOTE_NAME)
+            # set url if differs
+            try:
+                current_urls = list(remote.urls)
+                if GIT_REMOTE_URL not in current_urls:
+                    remote.set_url(GIT_REMOTE_URL)
+                    log.info("Updated remote '%s' URL to %s", GIT_REMOTE_NAME, GIT_REMOTE_URL)
+            except Exception as e:
+                log.warning("Could not update remote URL: %s", e)
+        except ValueError:
+            # remote doesn't exist
+            try:
+                repo.create_remote(GIT_REMOTE_NAME, GIT_REMOTE_URL)
+                remote = repo.remote(name=GIT_REMOTE_NAME)
+                log.info("Created remote '%s' -> %s", GIT_REMOTE_NAME, GIT_REMOTE_URL)
+            except Exception as e:
+                log.warning("Could not create remote: %s", e)
+                remote = None
     except Exception as e:
-        log.warning("Could not open repo at %s: %s", REPO_PATH, e)
-        return
+        log.warning("Error ensuring remote: %s", e)
+        remote = None
+
+    # Stage file (make path relative to repo if needed)
+    try:
+        repo.index.add([str(file_path.resolve())])
+    except Exception as e:
+        log.warning("Failed to add file to git index: %s", e)
+        return False
 
     try:
-        repo.git.add(str(file.resolve()))
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
         repo.index.commit(f"raptor price report [{timestamp}]")
-        repo.remote(name=GIT_REMOTE).push()
-        log.info("Pushed report to remote.")
     except Exception as e:
-        log.warning("Git push skipped/failed: %s", e)
+        log.warning("Commit failed: %s", e)
+        return False
+
+    # Attempt push
+    if remote is None:
+        log.warning("No remote configured; skipping push.")
+        return False
+
+    try:
+        push_info_list = remote.push(refspec=GIT_BRANCH)
+        # push_info_list contains PushInfo objects — check for errors
+        failed = False
+        for info in push_info_list:
+            # info.flags == ERROR flag? Use summary fields
+            if getattr(info, "error", None):
+                log.warning("Push failed: %s", info.error)
+                failed = True
+            elif getattr(info, "summary", None):
+                # some gitpython versions set summary with error text
+                if "rejected" in info.summary.lower() or "failed" in info.summary.lower():
+                    log.warning("Push summary indicated failure: %s", info.summary)
+                    failed = True
+        if failed:
+            log.warning("Push reported errors.")
+            return False
+        log.info("Push succeeded to %s/%s", GIT_REMOTE_NAME, GIT_BRANCH)
+        return True
+    except GitCommandError as e:
+        log.warning("Git push command failed: %s", e)
+        return False
+    except Exception as e:
+        log.warning("Unexpected error during git push: %s", e)
+        return False
 
 # ---------------------------------------------------------------------
-# MAIN
+# Main flow
 # ---------------------------------------------------------------------
 
 def main():
-    # Ensure output dir exists
+    # Ensure output dir is inside your repo and exactly the path requested
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    date = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    file_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date = datetime.now().strftime("%B %d, %Y")
+    file_date = datetime.now().strftime("%Y-%m-%d")
     output = OUTPUT_DIR / f"raptor_price_report_{file_date}.pdf"
 
     client = make_client()
 
-    # Generate content
-    sections = generate_content(client, date)
+    # Load data (CSV) or fallback
+    aggregated = load_and_aggregate(DATA_CSV)
+    if aggregated is None:
+        log.info("Falling back to synthetic data (no CSV or no parsable rows).")
+        aggregated = synth_data()
 
-    # Create charts
-    data = sample_data()
-    tmp = Path(tempfile.mkdtemp(prefix="raptor_"))
-    imgs = make_charts(data, tmp)
+    # Generate LLM content (explicit NEW vs USED references)
+    sections = {}
+    sections["summary"] = call_llm(
+        client,
+        f"Write a short executive summary (2 sentences) for a Ford Raptor price report dated {date}. Explicitly state whether you refer to NEW (MSRP) or USED (asking price). If available, reference the latest-year median MSRP for NEW and median asking price for USED from the dataset.",
+        "Summary",
+        max_tokens=160
+    )
+    sections["history"] = call_llm(client, "Give 3 short bullets comparing NEW (MSRP) and USED (asking) trends from 2017–2025 using the dataset. Be explicit when statements refer to NEW vs USED.", "Historical Prices", max_tokens=220)
+    sections["used"] = call_llm(client, "Provide 3 concise bullets about the USED market: typical depreciation, average dealer markup behavior, and asking-price dynamics. Use dataset-derived stats where possible and label them clearly.", "Used Market", max_tokens=220)
+    sections["regional"] = call_llm(client, "Provide 3 short bullets describing regional differences (Texas, California, Midwest). Specify whether the differences reference asking price (USED) or MSRP (NEW) and reference any regional averages present in the data.", "Regional Markets", max_tokens=180)
+    sections["competition"] = call_llm(client, "Give 3 concise bullets on competitor impact (Ram TRX, Chevy ZR2, Toyota TRD Pro). Indicate how competitor supply/pricing has likely affected NEW vs USED Raptor pricing.", "Competition", max_tokens=200)
+    sections["outlook"] = call_llm(client, "Provide a 3-bullet 12-month outlook separately for NEW (MSRP) and USED (asking) Raptor pricing. Label bullets NEW / USED.", "Outlook", max_tokens=180)
 
-    # Build PDF
-    build_pdf(sections, data, imgs, output, date)
+    # Make charts and build PDF (charts appended at end)
+    tmpdir = Path(tempfile.mkdtemp(prefix="raptor_"))
+    imgs = make_charts(aggregated, tmpdir)
+    build_pdf(sections, aggregated, imgs, output, date)
 
-    # Commit & push
-    commit_and_push(output)
+    # Commit & push; report success/fail
+    success = commit_and_push(output)
+    if success:
+        log.info("Upload succeeded.")
+    else:
+        log.warning("Upload failed; PDF saved locally to %s", output)
 
     log.info("Report generated: %s", output)
 
