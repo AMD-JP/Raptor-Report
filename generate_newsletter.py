@@ -1,12 +1,16 @@
+#!/usr/bin/env python3
 """
 Ford Raptor Price Trend Report Generator
 
-- Keeps original structure and AMD on-prem LLM client pattern.
-- Loads .env (preserves original setdefault behavior).
-- Default repository name set to a local folder named "Raptor-Report" (can be overridden via REPO_PATH env var).
-- PDF output directory set to "<REPO_PATH>/Raptor Report" per your new file destination.
-- Adds charts (MSRP trend, regional averages, competition) and a small KPI row for fast digestion.
-- Preserves git commit & push to origin/main.
+Changes requested:
+ - Use GitHub source derived from:
+   https://github.com/AMD-JP/Raptor-Report/blob/main/generate_newsletter.py
+   (script normalizes that to the repo remote URL)
+ - Output destination in file explorer:
+   C:\Users\jpichett\Raptor Report\newsletters
+
+Keeps original structure, .env loading, AMD OnPrem client pattern,
+and adds charts + KPI row for easier digestion.
 """
 
 import os
@@ -43,10 +47,9 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 # ---------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-
 _env = _SCRIPT_DIR / ".env"
 
-# preserve original env-loading semantics:
+# preserve original env-loading semantics
 if _env.exists():
     with open(_env) as f:
         for line in f:
@@ -54,18 +57,46 @@ if _env.exists():
                 k, v = line.strip().split("=", 1)
                 os.environ.setdefault(k, v)
 else:
-    # fallback to load_dotenv for safety
     load_dotenv(dotenv_path=_env)
 
-# If you cloned the GitHub repo into a different path set REPO_PATH env var;
-# default to a sibling/local directory called "Raptor-Report"
+# ---------------------------------------------------------------------
+# User-specified changes
+# ---------------------------------------------------------------------
+
+# The user provided a GitHub file URL; convert to a repo remote URL
+# Input from user:
+_USER_PROVIDED_GITHUB_FILE_URL = "https://github.com/AMD-JP/Raptor-Report/blob/main/generate_newsletter.py"
+
+def normalize_github_remote(file_url: str) -> str:
+    """
+    Convert a GitHub 'blob' file URL into the corresponding .git repo URL.
+    e.g.
+    https://github.com/AMD-JP/Raptor-Report/blob/main/generate_newsletter.py
+    -> https://github.com/AMD-JP/Raptor-Report.git
+    """
+    try:
+        # remove protocol & split
+        # find 'github.com/<owner>/<repo>'
+        m = re.match(r"https?://github\.com/([^/]+)/([^/]+)(/.*)?", file_url)
+        if not m:
+            return file_url  # fallback: return what we got
+        owner, repo = m.group(1), m.group(2)
+        return f"https://github.com/{owner}/{repo}.git"
+    except Exception:
+        return file_url
+
+GIT_REMOTE_URL = normalize_github_remote(_USER_PROVIDED_GITHUB_FILE_URL)
+
+# Destination folder requested:
+# Use raw string for Windows path
+OUTPUT_DIR = Path(r"C:\Users\jpichett\Raptor Report\newsletters")
+
+# Default repo path: assume user cloned the repo into a local folder named "Raptor-Report" next to script,
+# but allow override with REPO_PATH env var
 REPO_PATH = os.environ.get("REPO_PATH", str(_SCRIPT_DIR / "Raptor-Report"))
 
-# Per your request, the PDF files go into a folder named "Raptor Report" inside the repo
-OUTPUT_DIR = Path(REPO_PATH) / "Raptor Report"
-
 API_KEY = os.environ.get("PROJECT_API_KEY", "")
-GIT_REMOTE = "origin"
+GIT_REMOTE_NAME = "origin"
 GIT_BRANCH = "main"
 
 MODEL = "GPT-oss-20B"
@@ -400,15 +431,42 @@ def build_pdf(sections, data, imgs, output, date):
     doc.build(story)
 
 # ---------------------------------------------------------------------
-# GIT PUSH
+# GIT PUSH (sets remote URL to the normalized one first)
 # ---------------------------------------------------------------------
 
 def commit_and_push(file):
-    repo = git.Repo(REPO_PATH)
-    repo.git.add(str(file.resolve()))
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    repo.index.commit(f"raptor price report [{timestamp}]")
-    repo.remote(name=GIT_REMOTE).push()
+    try:
+        repo = git.Repo(REPO_PATH)
+    except Exception as e:
+        log.warning("Could not open repo at %s: %s", REPO_PATH, e)
+        return
+
+    try:
+        # ensure remote exists and points to the URL we normalized
+        try:
+            remote = repo.remote(name=GIT_REMOTE_NAME)
+            # update the remote URL to the normalized user-provided URL
+            try:
+                remote.set_url(GIT_REMOTE_URL)
+                log.info("Set remote '%s' URL to %s", GIT_REMOTE_NAME, GIT_REMOTE_URL)
+            except Exception as e:
+                log.warning("Could not set remote URL: %s", e)
+        except ValueError:
+            # remote doesn't exist; create it
+            try:
+                repo.create_remote(GIT_REMOTE_NAME, GIT_REMOTE_URL)
+                log.info("Created remote '%s' -> %s", GIT_REMOTE_NAME, GIT_REMOTE_URL)
+            except Exception as e:
+                log.warning("Could not create remote: %s", e)
+
+        repo.git.add(str(file.resolve()))
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        repo.index.commit(f"raptor price report [{timestamp}]")
+        # push; if remote isn't configured correctly, this may raise — catch and warn
+        repo.remote(name=GIT_REMOTE_NAME).push()
+        log.info("Pushed report to remote %s", GIT_REMOTE_NAME)
+    except Exception as e:
+        log.warning("Git push failed: %s", e)
 
 # ---------------------------------------------------------------------
 # MAIN
@@ -419,6 +477,7 @@ def main():
         print("Missing PROJECT_API_KEY in .env")
         sys.exit(1)
 
+    # Ensure the output directory exists (Windows path included)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     date = datetime.now(timezone.utc).strftime("%B %d, %Y")
@@ -427,10 +486,10 @@ def main():
 
     client = make_client()
 
-    # concise LLM-generated sections (keeps original prompts but prefers shorter responses)
+    # concise LLM-generated sections (keep original prompts but prefer short responses)
     sections = generate_content(client, date)
 
-    # synth data for charts (you can replace with real data ingestion later)
+    # synth data for charts
     data = synth_data()
     tmp_dir = Path(tempfile.mkdtemp(prefix="raptor_"))
     imgs = make_charts(data, tmp_dir)
@@ -438,7 +497,7 @@ def main():
     # build PDF with charts & KPIs
     build_pdf(sections, data, imgs, output, date)
 
-    # commit & push to repo (assumes the repo exists at REPO_PATH and has a remote origin)
+    # commit & push to repo (attempts to set remote from provided URL)
     commit_and_push(output)
 
     log.info("Report generated: %s", output)
