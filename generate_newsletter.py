@@ -2,8 +2,8 @@
 """
 Ford Raptor Price Trend Report Generator
 
-Fixed LLM auth: uses PROJECT_API_KEY from .env (no dummy).
-Includes charts, visuals, .env loading, and Windows path fixes.
+Fix: handle OpenAI/AMD SDK exceptions portably (some SDK builds don't expose openai.error).
+Uses PROJECT_API_KEY from .env, produces visuals, saves to Windows paths.
 """
 
 import os
@@ -37,10 +37,9 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
 # ---------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-
 _env = _SCRIPT_DIR / ".env"
 
-# preserve original .env-loading semantics (don't overwrite existing env vars)
+# Preserve original .env-loading semantics (don't overwrite existing env vars).
 if _env.exists():
     with open(_env) as f:
         for line in f:
@@ -55,7 +54,7 @@ if not API_KEY:
     print("Missing or empty PROJECT_API_KEY in environment/.env — please add it and re-run.")
     sys.exit(1)
 
-# Git repo location (fixed Windows paths as raw strings)
+# Windows paths (raw strings to avoid unicode-escape issues)
 REPO_PATH = Path(r"C:\Users\jpichett\Raptor-Report")
 OUTPUT_DIR = Path(r"C:\Users\jpichett\Raptor Report\newsletters")
 
@@ -78,13 +77,13 @@ GREY = colors.HexColor("#666666")
 BORDER = colors.HexColor("#DDDDDD")
 
 # ---------------------------------------------------------------------
-# AMD LLM CLIENT (now uses the real API key)
+# AMD LLM CLIENT (uses real API_KEY)
 # ---------------------------------------------------------------------
 
 def make_client():
     """
-    Construct the OpenAI/AMD on-prem client using the subscription key from .env.
-    The openai.OpenAI client accepts api_key and we also include the header expected by AMD.
+    Construct OpenAI client for AMD OnPrem endpoint.
+    Provide API key both via api_key and in headers for compatibility.
     """
     return openai.OpenAI(
         base_url="https://llm-api.amd.com/OnPrem",
@@ -100,10 +99,8 @@ def make_client():
 # ---------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
-    """Sanitize LLM output so ReportLab never crashes."""
     if not text:
         return ""
-
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"[#*`]", "", text)
     for a, b in [("\u2014", "-"), ("\u2013", "-"),
@@ -114,7 +111,7 @@ def clean_text(text: str) -> str:
     return escape(text).strip()
 
 # ---------------------------------------------------------------------
-# LLM CALL (with clearer error handling)
+# LLM CALL with portable error handling
 # ---------------------------------------------------------------------
 
 def call_llm(client, prompt, section, max_tokens=None):
@@ -134,17 +131,20 @@ def call_llm(client, prompt, section, max_tokens=None):
                 {"role": "user", "content": prompt},
             ],
         )
-    except openai.error.AuthenticationError as e:
-        # clearer, actionable message
-        log.error("Authentication failed when calling LLM: %s", e)
-        raise RuntimeError(
-            "LLM authentication failed (401). Check PROJECT_API_KEY in your .env and that the "
-            "subscription key is valid and active for the OnPrem endpoint."
-        ) from e
     except Exception as e:
-        log.error("LLM call failed: %s", e)
-        raise
+        # Some SDK builds expose AuthenticationError, others do not.
+        msg = str(e).lower()
+        if "401" in msg or "access denied" in msg or "invalid subscription" in msg or "authentication" in msg:
+            log.error("LLM authentication error: %s", e)
+            raise RuntimeError(
+                "LLM authentication failed (401). Check PROJECT_API_KEY in your .env and confirm the "
+                "subscription key is valid/active for the AMD OnPrem endpoint."
+            ) from e
+        else:
+            log.error("LLM call failed: %s", e)
+            raise
 
+    # Extract and sanitize content
     content = response.choices[0].message.content
     return clean_text(content)
 
@@ -187,7 +187,7 @@ Provide a short 12 month outlook for Ford Raptor pricing in 3 bullets.
     return sections
 
 # ---------------------------------------------------------------------
-# SAMPLE DATA FOR CHARTS
+# SYNTHETIC DATA (for charts)
 # ---------------------------------------------------------------------
 
 def sample_data():
@@ -214,7 +214,6 @@ def make_charts(data, outdir: Path):
     outdir.mkdir(parents=True, exist_ok=True)
     imgs = {}
 
-    # MSRP trend
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(data["years"], data["msrp"], marker="o", linewidth=2)
     ax.set_title("Ford Raptor MSRP — Median (2017–2025)", fontsize=10)
@@ -227,26 +226,24 @@ def make_charts(data, outdir: Path):
     plt.close(fig)
     imgs["msrp_trend"] = str(p1)
 
-    # Regional bar
     latest = {k: float(v[-1]) for k, v in data["regions"].items()}
     fig, ax = plt.subplots(figsize=(6, 3))
     ax.bar(list(latest.keys()), list(latest.values()))
     ax.set_title("Regional Average Asking Price (latest year)", fontsize=10)
     ax.set_ylabel("Price (USD)", fontsize=8)
-    fig.tight_layout()
     p2 = outdir / "regional_bar.png"
+    fig.tight_layout()
     fig.savefig(p2, dpi=150)
     plt.close(fig)
     imgs["regional_bar"] = str(p2)
 
-    # Competition pie
     labels = list(data["competition"].keys())
     vals = list(data["competition"].values())
     fig, ax = plt.subplots(figsize=(6, 3))
     ax.pie(vals, labels=labels, autopct="%1.0f%%", startangle=140)
     ax.set_title("Relative Competitive Share", fontsize=10)
-    fig.tight_layout()
     p3 = outdir / "competition_pie.png"
+    fig.tight_layout()
     fig.savefig(p3, dpi=150)
     plt.close(fig)
     imgs["competition_pie"] = str(p3)
@@ -283,27 +280,23 @@ def build_pdf(sections, data, imgs, output, date):
     story = []
     width = letter[0] - 1.5 * inch
 
-    # Masthead
-    masthead = Table([[Paragraph("FORD RAPTOR", s["title"])], [Paragraph("PRICE TREND REPORT", s["title"])], [Paragraph(date, s["footer"]) ]], colWidths=[width])
+    masthead = Table([[Paragraph("FORD RAPTOR", s["title"])], [Paragraph("PRICE TREND REPORT", s["title"])], [Paragraph(date, s["footer"])]], colWidths=[width])
     masthead.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),FORD_BLUE), ("TOPPADDING",(0,0),(-1,-1),12), ("BOTTOMPADDING",(0,0),(-1,-1),12)]))
     story.append(masthead)
     story.append(Spacer(1,10))
 
-    # KPI row
     kpis = data.get("kpis", {})
     kpi_table = Table([[Paragraph("Median (recent)", s["kpi"]), Paragraph("YoY %", s["kpi"]), Paragraph("Latest Year", s["kpi"])], [f"${kpis.get('median_price',0):,.0f}", f"{kpis.get('yoy_change_pct',0):+.2f}%", str(data["years"][-1]) ]], colWidths=[width/3.0]*3)
     kpi_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#F5F7FA")), ("ALIGN",(0,1),(-1,-1),"CENTER"), ("VALIGN",(0,0),(-1,-1),"MIDDLE"), ("INNERGRID",(0,0),(-1,-1),0.25,BORDER), ("BOX",(0,0),(-1,-1),0.5,BORDER)]))
     story.append(kpi_table)
     story.append(Spacer(1,10))
 
-    # Executive summary
     story.append(Paragraph("EXECUTIVE SUMMARY", s["section"]))
     story.append(HRFlowable(width=width, thickness=1, color=FORD_BLUE))
     for p in split_paragraphs(sections.get("summary","")):
         story.append(Paragraph(p, s["body"]))
     story.append(Spacer(1,10))
 
-    # Key visuals
     story.append(Paragraph("KEY VISUALS", s["section"]))
     story.append(HRFlowable(width=width, thickness=0.8, color=FORD_BLUE))
     story.append(Spacer(1,6))
@@ -314,7 +307,6 @@ def build_pdf(sections, data, imgs, output, date):
     story.append(two_col)
     story.append(Spacer(1,12))
 
-    # Sections limited to 3 short paragraphs
     sections_order = [("HISTORICAL PRICE TRENDS","history"), ("USED MARKET ANALYSIS","used"), ("REGIONAL MARKET DIFFERENCES","regional"), ("COMPETITOR IMPACT","competition"), ("PRICE OUTLOOK","outlook")]
     for title,key in sections_order:
         story.append(Paragraph(title, s["section"]))
