@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""
-Ford Raptor Price Trend Report Generator
-
-Adjustments made:
-- OUTPUT_DIR set to C:\Users\jpichett\Raptor-Report\newsletters (raw string)
-- commit_and_push() will clone the repo if missing and will attempt to set/validate remote before pushing
-- clearer push result logging and boolean return for upload success
-- preserves CSV ingestion (new vs used), charts at the end, and AMD OnPrem LLM auth handling
-"""
+# Ford Raptor Price Trend Report Generator
+# (Paths fixed so there are no un-escaped backslashes in normal string literals.)
 
 import os
 import re
@@ -61,10 +54,10 @@ if not API_KEY:
     print("Missing or empty PROJECT_API_KEY in environment/.env — please add it and re-run.")
     sys.exit(1)
 
-# Ensure REPO_PATH is where your repo lives locally
+# Ensure REPO_PATH is where your repo lives locally (raw string)
 REPO_PATH = Path(os.environ.get("REPO_PATH", r"C:\Users\jpichett\Raptor-Report"))
 
-# Output directory requested (inside your repo)
+# Output directory requested (inside your repo) - raw string default
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(REPO_PATH / "newsletters")))
 
 # Default remote repo URL (used if local repo missing). Override by setting GIT_REMOTE_URL env var.
@@ -152,7 +145,7 @@ def call_llm(client, prompt, section, max_tokens=None):
     return clean_text(content)
 
 # ---------------------------------------------------------------------
-# CSV parsing and aggregation (same as previous)
+# CSV parsing and aggregation
 # ---------------------------------------------------------------------
 
 def parse_row(row):
@@ -184,13 +177,11 @@ def load_and_aggregate(csv_path):
         log.info("CSV present but no parsable rows")
         return None
 
-    # Aggregation
     msrp_by_year_new = {}
     price_by_year_used = {}
     region_prices_latest = {}
     now_year = datetime.now().year
 
-    # determine years set and latest year
     years = set()
     date_years = [r["date"].year for r in rows if r["date"]]
     years.update(date_years)
@@ -204,7 +195,7 @@ def load_and_aggregate(csv_path):
             msrp_by_year_new.setdefault(yr, []).append(r["msrp"])
         if cond == "used" and r["price"] is not None:
             price_by_year_used.setdefault(yr, []).append(r["price"])
-        # region latest-year averages
+
     region_prices = {}
     for r in rows:
         r_year = r["date"].year if r["date"] else (r["model_year"] or now_year)
@@ -212,7 +203,6 @@ def load_and_aggregate(csv_path):
             region_prices.setdefault(r["region"], []).append(r["price"])
     region_prices_latest = {reg: mean(vals) for reg, vals in region_prices.items()}
 
-    # dealer markup and depreciation
     markups = []
     markup_pct = []
     dep_by_model_year = {}
@@ -364,7 +354,6 @@ def build_pdf(sections, data, imgs, output, date):
         for p in split_paragraphs(sections.get(key,""))[:4]:
             story.append(Paragraph(p, s["body"])); story.append(Spacer(1,8))
 
-    # Charts at the end
     story.append(Spacer(1,12)); story.append(HRFlowable(width=width, thickness=0.5, color=BORDER)); story.append(Spacer(1,8))
     story.append(Paragraph("APPENDIX — CHARTS & VISUALS", s["section"])); story.append(HRFlowable(width=width, thickness=0.8, color=FORD_BLUE)); story.append(Spacer(1,8))
 
@@ -394,12 +383,10 @@ def build_pdf(sections, data, imgs, output, date):
 # ---------------------------------------------------------------------
 
 def ensure_repo_present():
-    """Return git.Repo object, cloning from remote if local repo missing."""
     try:
         repo = git.Repo(REPO_PATH)
         return repo
     except Exception:
-        # try to clone
         try:
             log.info("Local repo not found at %s — cloning from %s", REPO_PATH, GIT_REMOTE_URL)
             repo = git.Repo.clone_from(GIT_REMOTE_URL, REPO_PATH)
@@ -410,18 +397,14 @@ def ensure_repo_present():
             return None
 
 def commit_and_push(file_path: Path) -> bool:
-    """Add, commit, and push file. Returns True on successful push, False otherwise."""
     repo = ensure_repo_present()
     if repo is None:
         log.warning("No repo available at %s and clone failed. Skipping upload.", REPO_PATH)
         return False
-
-    # ensure remote exists and points to desired URL
     try:
         remote = None
         try:
             remote = repo.remote(name=GIT_REMOTE_NAME)
-            # set url if differs
             try:
                 current_urls = list(remote.urls)
                 if GIT_REMOTE_URL not in current_urls:
@@ -430,7 +413,6 @@ def commit_and_push(file_path: Path) -> bool:
             except Exception as e:
                 log.warning("Could not update remote URL: %s", e)
         except ValueError:
-            # remote doesn't exist
             try:
                 repo.create_remote(GIT_REMOTE_NAME, GIT_REMOTE_URL)
                 remote = repo.remote(name=GIT_REMOTE_NAME)
@@ -441,37 +423,28 @@ def commit_and_push(file_path: Path) -> bool:
     except Exception as e:
         log.warning("Error ensuring remote: %s", e)
         remote = None
-
-    # Stage file (make path relative to repo if needed)
     try:
         repo.index.add([str(file_path.resolve())])
     except Exception as e:
         log.warning("Failed to add file to git index: %s", e)
         return False
-
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
         repo.index.commit(f"raptor price report [{timestamp}]")
     except Exception as e:
         log.warning("Commit failed: %s", e)
         return False
-
-    # Attempt push
     if remote is None:
         log.warning("No remote configured; skipping push.")
         return False
-
     try:
         push_info_list = remote.push(refspec=GIT_BRANCH)
-        # push_info_list contains PushInfo objects — check for errors
         failed = False
         for info in push_info_list:
-            # info.flags == ERROR flag? Use summary fields
             if getattr(info, "error", None):
                 log.warning("Push failed: %s", info.error)
                 failed = True
             elif getattr(info, "summary", None):
-                # some gitpython versions set summary with error text
                 if "rejected" in info.summary.lower() or "failed" in info.summary.lower():
                     log.warning("Push summary indicated failure: %s", info.summary)
                     failed = True
@@ -492,7 +465,6 @@ def commit_and_push(file_path: Path) -> bool:
 # ---------------------------------------------------------------------
 
 def main():
-    # Ensure output dir is inside your repo and exactly the path requested
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     date = datetime.now().strftime("%B %d, %Y")
@@ -501,13 +473,11 @@ def main():
 
     client = make_client()
 
-    # Load data (CSV) or fallback
     aggregated = load_and_aggregate(DATA_CSV)
     if aggregated is None:
         log.info("Falling back to synthetic data (no CSV or no parsable rows).")
         aggregated = synth_data()
 
-    # Generate LLM content (explicit NEW vs USED references)
     sections = {}
     sections["summary"] = call_llm(
         client,
@@ -521,12 +491,10 @@ def main():
     sections["competition"] = call_llm(client, "Give 3 concise bullets on competitor impact (Ram TRX, Chevy ZR2, Toyota TRD Pro). Indicate how competitor supply/pricing has likely affected NEW vs USED Raptor pricing.", "Competition", max_tokens=200)
     sections["outlook"] = call_llm(client, "Provide a 3-bullet 12-month outlook separately for NEW (MSRP) and USED (asking) Raptor pricing. Label bullets NEW / USED.", "Outlook", max_tokens=180)
 
-    # Make charts and build PDF (charts appended at end)
     tmpdir = Path(tempfile.mkdtemp(prefix="raptor_"))
     imgs = make_charts(aggregated, tmpdir)
     build_pdf(sections, aggregated, imgs, output, date)
 
-    # Commit & push; report success/fail
     success = commit_and_push(output)
     if success:
         log.info("Upload succeeded.")
